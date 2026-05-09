@@ -199,32 +199,56 @@ def push_qq_message(title, body, image_url):
     if not token:
         return
 
-    content = f"{title}\n{body}"
-    if image_url:
-        content += f"\n图片: {image_url}"
-
     headers = {
         "Authorization": f"QQBot {token}",
         "Content-Type": "application/json"
     }
-    payload = {"msg_type": 0, "content": content}
+    text_payload = {"msg_type": 0, "content": f"{title}\n{body}"}
+
+    def send_text(url):
+        return requests.post(url, headers=headers, json=text_payload, timeout=10)
+
+    def send_image(url):
+        if not image_url:
+            return None, "no_image"
+        # 1) 上传远端图片资源到 QQ 文件接口
+        file_api = url.replace("/messages", "/files")
+        file_payload = {"file_type": 1, "url": image_url, "srv_send_msg": False}
+        file_res = requests.post(file_api, headers=headers, json=file_payload, timeout=15)
+        if not file_res.ok:
+            return None, f"upload_failed: {file_res.status_code} {file_res.text}"
+        media = file_res.json()
+        # 2) 使用富媒体消息发送图片（可带简短文案）
+        msg_payload = {"msg_type": 7, "content": f"{title}\n{body}", "media": media}
+        msg_res = requests.post(url, headers=headers, json=msg_payload, timeout=10)
+        if not msg_res.ok:
+            return None, f"send_failed: {msg_res.status_code} {msg_res.text}"
+        return msg_res, None
 
     try:
         if QQ_BOT_GROUP_OPENID:
             url = f"{QQ_BOT_API_BASE}/v2/groups/{QQ_BOT_GROUP_OPENID}/messages"
-            res = requests.post(url, headers=headers, json=payload, timeout=10)
-            if res.ok:
-                print("✅ QQ 群聊推送已发送")
+            img_res, img_err = send_image(url)
+            if img_res is not None:
+                print("✅ QQ 群聊图片推送已发送")
             else:
-                print(f"❌ QQ 群聊推送失败: {res.status_code} {res.text}")
+                res = send_text(url)
+                if res.ok:
+                    print(f"✅ QQ 群聊文本推送已发送（图片降级: {img_err}）")
+                else:
+                    print(f"❌ QQ 群聊推送失败: {res.status_code} {res.text}")
 
         if QQ_BOT_USER_OPENID:
             url = f"{QQ_BOT_API_BASE}/v2/users/{QQ_BOT_USER_OPENID}/messages"
-            res = requests.post(url, headers=headers, json=payload, timeout=10)
-            if res.ok:
-                print("✅ QQ 单聊推送已发送")
+            img_res, img_err = send_image(url)
+            if img_res is not None:
+                print("✅ QQ 单聊图片推送已发送")
             else:
-                print(f"❌ QQ 单聊推送失败: {res.status_code} {res.text}")
+                res = send_text(url)
+                if res.ok:
+                    print(f"✅ QQ 单聊文本推送已发送（图片降级: {img_err}）")
+                else:
+                    print(f"❌ QQ 单聊推送失败: {res.status_code} {res.text}")
     except Exception as e:
         print(f"❌ QQ 推送请求异常: {e}")
 
