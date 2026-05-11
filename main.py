@@ -1,6 +1,7 @@
 import os
 import requests
 import asyncio
+import time
 from datetime import datetime, timedelta, timezone
 from jinja2 import Environment, FileSystemLoader
 from playwright.async_api import async_playwright
@@ -14,6 +15,7 @@ QQ_BOT_APP_ID = os.environ.get("QQ_BOT_APP_ID")
 QQ_BOT_APP_SECRET = os.environ.get("QQ_BOT_APP_SECRET")
 QQ_BOT_GROUP_OPENID = os.environ.get("QQ_BOT_GROUP_OPENID")
 QQ_BOT_USER_OPENID = os.environ.get("QQ_BOT_USER_OPENID")
+QQ_BOT_TARGETS = os.environ.get("QQ_BOT_TARGETS", "")
 
 GAME_API_URL = "https://wegame.shallow.ink/api/v1/games/rocom/merchant/info"
 NOTIFYME_SERVER = "https://notifyme-server.wzn556.top/api/send"
@@ -190,25 +192,87 @@ def get_qq_access_token():
         print(f"❌ QQ Token 请求异常: {e}")
         return None
 
+
+def build_qq_targets():
+    """构建 QQ 机器人目标列表（兼容单机器人与多机器人）"""
+    targets = []
+
+    # 1) 兼容旧配置：单机器人
+    if QQ_BOT_APP_ID and QQ_BOT_APP_SECRET and (QQ_BOT_GROUP_OPENID or QQ_BOT_USER_OPENID):
+        targets.append({
+            "name": "default",
+            "app_id": QQ_BOT_APP_ID,
+            "app_secret": QQ_BOT_APP_SECRET,
+            "group_openid": QQ_BOT_GROUP_OPENID,
+            "user_openid": QQ_BOT_USER_OPENID,
+        })
+
+    # 2) 新配置：多机器人（分号分隔）
+    # 格式：
+    # QQ_BOT_TARGETS="name1|app_id|app_secret|group_openid|user_openid;name2|app_id|app_secret|group_openid|user_openid"
+    # group_openid / user_openid 可留空，但二者至少一个有值
+    if QQ_BOT_TARGETS:
+        for raw in QQ_BOT_TARGETS.split(";"):
+            part = raw.strip()
+            if not part:
+                continue
+            cols = [c.strip() for c in part.split("|")]
+            if len(cols) != 5:
+                print(f"⚠️ 跳过非法 QQ_BOT_TARGETS 配置: {part}")
+                continue
+            name, app_id, app_secret, group_openid, user_openid = cols
+            if not app_id or not app_secret or (not group_openid and not user_openid):
+                print(f"⚠️ 跳过不完整 QQ_BOT_TARGETS 配置: {part}")
+                continue
+            targets.append({
+                "name": name or "unnamed",
+                "app_id": app_id,
+                "app_secret": app_secret,
+                "group_openid": group_openid or None,
+                "user_openid": user_openid or None,
+            })
+
+    # 去重（同 app_id + group + user）
+    dedup = []
+    seen = set()
+    for t in targets:
+        key = (t["app_id"], t.get("group_openid"), t.get("user_openid"))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(t)
+    return dedup
+
+
+def get_qq_access_token_for_target(app_id, app_secret):
+    """按目标机器人获取 Access Token"""
+    try:
+        res = requests.post(
+            QQ_BOT_TOKEN_URL,
+            json={"appId": app_id, "clientSecret": app_secret},
+            timeout=10
+        )
+        res.raise_for_status()
+        token = res.json().get("access_token")
+        if not token:
+            print(f"❌ QQ Token 获取失败({app_id}): {res.text}")
+        return token
+    except Exception as e:
+        print(f"❌ QQ Token 请求异常({app_id}): {e}")
+        return None
+
 def push_qq_message(title, body, image_url):
     """推送到 QQ 机器人（群聊或单聊）"""
-    if not (QQ_BOT_GROUP_OPENID or QQ_BOT_USER_OPENID):
+    targets = build_qq_targets()
+    if not targets:
         return
 
-    token = get_qq_access_token()
-    if not token:
-        return
-
-    headers = {
-        "Authorization": f"QQBot {token}",
-        "Content-Type": "application/json"
-    }
     text_payload = {"msg_type": 0, "content": f"{title}\n{body}"}
 
-    def send_text(url):
+    def send_text(url, headers):
         return requests.post(url, headers=headers, json=text_payload, timeout=10)
 
-    def send_image(url):
+    def send_image(url, headers):
         if not image_url:
             return None, "no_image"
         # 1) 上传远端图片资源到 QQ 文件接口
@@ -226,29 +290,40 @@ def push_qq_message(title, body, image_url):
         return msg_res, None
 
     try:
-        if QQ_BOT_GROUP_OPENID:
-            url = f"{QQ_BOT_API_BASE}/v2/groups/{QQ_BOT_GROUP_OPENID}/messages"
-            img_res, img_err = send_image(url)
-            if img_res is not None:
-                print("✅ QQ 群聊图片推送已发送")
-            else:
-                res = send_text(url)
-                if res.ok:
-                    print(f"✅ QQ 群聊文本推送已发送（图片降级: {img_err}）")
-                else:
-                    print(f"❌ QQ 群聊推送失败: {res.status_code} {res.text}")
+        for t in targets:
+            token = get_qq_access_token_for_target(t["app_id"], t["app_secret"])
+            if not token:
+                continue
 
-        if QQ_BOT_USER_OPENID:
-            url = f"{QQ_BOT_API_BASE}/v2/users/{QQ_BOT_USER_OPENID}/messages"
-            img_res, img_err = send_image(url)
-            if img_res is not None:
-                print("✅ QQ 单聊图片推送已发送")
-            else:
-                res = send_text(url)
-                if res.ok:
-                    print(f"✅ QQ 单聊文本推送已发送（图片降级: {img_err}）")
+            headers = {
+                "Authorization": f"QQBot {token}",
+                "Content-Type": "application/json"
+            }
+            label = t.get("name") or t["app_id"]
+
+            if t.get("group_openid"):
+                url = f"{QQ_BOT_API_BASE}/v2/groups/{t['group_openid']}/messages"
+                img_res, img_err = send_image(url, headers)
+                if img_res is not None:
+                    print(f"✅ [{label}] QQ 群聊图片推送已发送")
                 else:
-                    print(f"❌ QQ 单聊推送失败: {res.status_code} {res.text}")
+                    res = send_text(url, headers)
+                    if res.ok:
+                        print(f"✅ [{label}] QQ 群聊文本推送已发送（图片降级: {img_err}）")
+                    else:
+                        print(f"❌ [{label}] QQ 群聊推送失败: {res.status_code} {res.text}")
+
+            if t.get("user_openid"):
+                url = f"{QQ_BOT_API_BASE}/v2/users/{t['user_openid']}/messages"
+                img_res, img_err = send_image(url, headers)
+                if img_res is not None:
+                    print(f"✅ [{label}] QQ 单聊图片推送已发送")
+                else:
+                    res = send_text(url, headers)
+                    if res.ok:
+                        print(f"✅ [{label}] QQ 单聊文本推送已发送（图片降级: {img_err}）")
+                    else:
+                        print(f"❌ [{label}] QQ 单聊推送失败: {res.status_code} {res.text}")
     except Exception as e:
         print(f"❌ QQ 推送请求异常: {e}")
 
@@ -281,14 +356,29 @@ def push_all(title, body, markdown, image_url):
 
 # ================= 5. 主入口 =================
 
+def fetch_game_data_with_retry(max_retries=3):
+    """请求商人接口，失败自动重试"""
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.get(GAME_API_URL, headers={"X-API-Key": ROCOM_API_KEY}, timeout=30)
+            resp.raise_for_status()
+            payload = resp.json()
+            if payload.get("code") != 0:
+                raise RuntimeError(payload.get("message") or "接口返回异常")
+            return payload.get("data", {}), None
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                wait_seconds = attempt * 2
+                print(f"⚠️ 第 {attempt}/{max_retries} 次请求失败，{wait_seconds} 秒后重试: {e}")
+                time.sleep(wait_seconds)
+            else:
+                print(f"❌ 请求重试失败，已达上限 {max_retries} 次: {e}")
+    return None, f"请求异常: {last_err}"
+
 async def main():
-    try:
-        resp = requests.get(GAME_API_URL, headers={"X-API-Key": ROCOM_API_KEY}, timeout=30)
-        resp.raise_for_status()
-        raw_data = resp.json().get("data", {})
-        err = None if resp.json().get("code") == 0 else resp.json().get("message")
-    except Exception as e:
-        raw_data, err = None, f"请求异常: {e}"
+    raw_data, err = fetch_game_data_with_retry(max_retries=3)
     
     if err or not raw_data:
         push_all("⚠️ 监控异常", err or "无法获取数据", "无法获取数据", None)
